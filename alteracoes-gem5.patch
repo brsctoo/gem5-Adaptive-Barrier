@@ -1,0 +1,1484 @@
+diff --git a/configs/barreira/teste_m5_barreira.py b/configs/barreira/teste_m5_barreira.py
+new file mode 100644
+index 0000000000..bcf68ee259
+--- /dev/null
++++ b/configs/barreira/teste_m5_barreira.py
+@@ -0,0 +1,79 @@
++from pathlib import Path
++
++import m5
++from m5.objects import (
++    AddrRange,
++    DDR3_1600_8x8,
++    MemCtrl,
++    Process,
++    Root,
++    SEWorkload,
++    SrcClockDomain,
++    System,
++    SystemXBar,
++    TimingSimpleCPU,
++    VoltageDomain,
++)
++
++system.barrier_monitor = BarrierMonitor(
++    participants=1,
++    cpus=[system.cpu],
++)
++
++# Localiza o executável a partir da localização deste script.
++raiz = Path(__file__).resolve().parents[2]
++binario = raiz / "workloads/p02/teste_m5_barrier"
++
++system = System()
++
++# Clock da máquina simulada.
++system.clk_domain = SrcClockDomain()
++system.clk_domain.clock = "2GHz"
++system.clk_domain.voltage_domain = VoltageDomain()
++
++# Memória e modelo de execução.
++system.mem_mode = "timing"
++system.mem_ranges = [AddrRange("512MiB")]
++
++# Uma CPU, suficiente para testar as duas chamadas.
++system.cpu = TimingSimpleCPU()
++system.cpu.createInterruptController()
++
++# Barramento que conecta CPU e memória.
++system.membus = SystemXBar()
++system.cpu.icache_port = system.membus.cpu_side_ports
++system.cpu.dcache_port = system.membus.cpu_side_ports
++
++# Conexões de interrupção necessárias para x86.
++system.cpu.interrupts[0].pio = system.membus.mem_side_ports
++system.cpu.interrupts[0].int_requestor = system.membus.cpu_side_ports
++system.cpu.interrupts[0].int_responder = system.membus.mem_side_ports
++
++# Controlador e memória DDR3.
++system.mem_ctrl = MemCtrl()
++system.mem_ctrl.dram = DDR3_1600_8x8()
++system.mem_ctrl.dram.range = system.mem_ranges[0]
++system.mem_ctrl.port = system.membus.mem_side_ports
++
++system.system_port = system.membus.cpu_side_ports
++
++# Programa executado em modo SE.
++system.workload = SEWorkload.init_compatible(str(binario))
++
++process = Process()
++process.cmd = [str(binario)]
++
++system.cpu.workload = process
++system.cpu.createThreads()
++
++root = Root(full_system=False, system=system)
++
++m5.instantiate()
++
++print("Iniciando teste de m5_barrier...")
++
++# Limite para evitar que um problema deixe o teste rodando indefinidamente.
++evento = m5.simulate(100_000_000_000)
++
++print(f"Simulação encerrada no tick {m5.curTick()}.")
++print(f"Motivo: {evento.getCause()}")
+diff --git a/configs/barreira/teste_monitor.py b/configs/barreira/teste_monitor.py
+new file mode 100644
+index 0000000000..a9f1f7654d
+--- /dev/null
++++ b/configs/barreira/teste_monitor.py
+@@ -0,0 +1,80 @@
++from pathlib import Path
++
++import m5
++from m5.objects import (
++    AddrRange,
++    BarrierMonitor,
++    DDR3_1600_8x8,
++    MemCtrl,
++    Process,
++    Root,
++    SEWorkload,
++    SrcClockDomain,
++    System,
++    SystemXBar,
++    TimingSimpleCPU,
++    VoltageDomain,
++)
++
++root_dir = Path(__file__).resolve().parents[2]
++binary = root_dir / "workloads/p02/teste_monitor"
++
++if not binary.is_file():
++    raise FileNotFoundError(f"Programa não encontrado: {binary}")
++
++system = System()
++
++system.clk_domain = SrcClockDomain(
++    clock="2GHz",
++    voltage_domain=VoltageDomain(),
++)
++
++system.mem_mode = "timing"
++system.mem_ranges = [AddrRange("512MiB")]
++
++system.cpu = [
++    TimingSimpleCPU(cpu_id=0),
++    TimingSimpleCPU(cpu_id=1),
++]
++
++system.membus = SystemXBar()
++system.system_port = system.membus.cpu_side_ports
++
++for cpu in system.cpu:
++    cpu.icache_port = system.membus.cpu_side_ports
++    cpu.dcache_port = system.membus.cpu_side_ports
++
++    cpu.createInterruptController()
++    cpu.interrupts[0].pio = system.membus.mem_side_ports
++    cpu.interrupts[0].int_requestor = system.membus.cpu_side_ports
++    cpu.interrupts[0].int_responder = system.membus.mem_side_ports
++
++system.mem_ctrl = MemCtrl()
++system.mem_ctrl.dram = DDR3_1600_8x8()
++system.mem_ctrl.dram.range = system.mem_ranges[0]
++system.mem_ctrl.port = system.membus.mem_side_ports
++
++system.workload = SEWorkload.init_compatible(str(binary))
++
++process = Process()
++process.cmd = [str(binary)]
++
++for cpu in system.cpu:
++    cpu.workload = process
++    cpu.createThreads()
++
++system.barrier_monitor = BarrierMonitor(
++    participants=2,
++    cpus=system.cpu,
++)
++
++root = Root(full_system=False, system=system)
++
++m5.instantiate()
++
++print("Iniciando teste do monitor com duas threads...")
++
++event = m5.simulate(100_000_000_000)
++
++print(f"Simulação encerrada no tick {m5.curTick()}.")
++print(f"Motivo: {event.getCause()}")
+diff --git a/configs/projetos/p02/sistema_p02.py b/configs/projetos/p02/sistema_p02.py
+new file mode 100644
+index 0000000000..3bd372abaf
+--- /dev/null
++++ b/configs/projetos/p02/sistema_p02.py
+@@ -0,0 +1,152 @@
++import argparse
++from pathlib import Path
++
++import m5
++from m5.objects import *
++
++
++parser = argparse.ArgumentParser()
++
++parser.add_argument("--threads", type=int, default=4)
++
++parser.add_argument(
++    "--alg",
++    choices=["central", "dissem", "auto"],
++    default="central",
++)
++
++parser.add_argument("--limiar", type=int, default=8)
++
++parser.add_argument(
++    "--prog",
++    choices=["micro", "jacobi", "integ"],
++    default="micro",
++)
++
++parser.add_argument("--work", type=int, default=0)
++parser.add_argument("--imbalance", type=float, default=0.0)
++parser.add_argument("--iters", type=int, default=100)
++parser.add_argument("--perturb", type=int, default=0)
++
++parser.add_argument(
++    "--cpu",
++    choices=["timing", "o3"],
++    default="timing",
++)
++
++parser.add_argument("--no-monitor", action="store_true")
++
++args = parser.parse_args()
++
++if args.threads <= 0 or args.iters <= 0:
++    parser.error("Threads e iterações devem ser maiores que zero.")
++
++if args.work < 0 or args.imbalance < 0 or args.perturb < 0:
++    parser.error("Trabalho, desequilíbrio e semente não podem ser negativos.")
++
++if args.alg == "auto" and args.limiar <= 0:
++    parser.error("O limiar deve ser maior que zero para usar auto.")
++
++root_dir = Path(__file__).resolve().parents[3]
++binary = root_dir / "workloads/p02" / args.prog
++
++if not binary.is_file():
++    parser.error(f"Programa não encontrado: {binary}. Compile o workload primeiro.")
++
++
++# Parâmetros das caches baseados em configs/learning_gem5/part1/caches.py.
++class L1Cache(Cache):
++    assoc = 2
++    tag_latency = 2
++    data_latency = 2
++    response_latency = 2
++    mshrs = 4
++    tgts_per_mshr = 20
++
++
++class L2Cache(Cache):
++    size = "256KiB"
++    assoc = 8
++    tag_latency = 20
++    data_latency = 20
++    response_latency = 20
++    mshrs = 20
++    tgts_per_mshr = 12
++
++
++system = System()
++system.clk_domain = SrcClockDomain(
++    clock="2GHz",
++    voltage_domain=VoltageDomain(),
++)
++system.mem_mode = "timing"
++system.mem_ranges = [AddrRange("512MiB")]
++system.cache_line_size = 64
++
++system.membus = SystemXBar()
++system.l2bus = L2XBar()
++system.system_port = system.membus.cpu_side_ports
++
++system.l2 = L2Cache()
++system.l2.cpu_side = system.l2bus.mem_side_ports
++system.l2.mem_side = system.membus.cpu_side_ports
++
++if args.cpu == "timing":
++    system.cpu = [TimingSimpleCPU(cpu_id=i) for i in range(args.threads)]
++else:
++    system.cpu = [DerivO3CPU(cpu_id=i) for i in range(args.threads)]
++
++for cpu in system.cpu:
++    cpu.icache = L1Cache(size="16KiB", is_read_only=True)
++    cpu.dcache = L1Cache(size="64KiB")
++
++    cpu.icache_port = cpu.icache.cpu_side
++    cpu.dcache_port = cpu.dcache.cpu_side
++    cpu.icache.mem_side = system.l2bus.cpu_side_ports
++    cpu.dcache.mem_side = system.l2bus.cpu_side_ports
++
++    cpu.mmu.connectWalkerPorts(
++        system.l2bus.cpu_side_ports,
++        system.l2bus.cpu_side_ports,
++    )
++
++    cpu.createInterruptController()
++    cpu.interrupts[0].pio = system.membus.mem_side_ports
++    cpu.interrupts[0].int_requestor = system.membus.cpu_side_ports
++    cpu.interrupts[0].int_responder = system.membus.mem_side_ports
++
++system.mem_ctrl = MemCtrl()
++system.mem_ctrl.dram = DDR3_1600_8x8()
++system.mem_ctrl.dram.range = system.mem_ranges[0]
++system.mem_ctrl.port = system.membus.mem_side_ports
++
++if not args.no_monitor:
++    system.barrier_monitor = BarrierMonitor(
++        participants=args.threads,
++        cpus=system.cpu,
++        hist_max=1_000_000,
++        hist_buckets=100,
++    )
++
++system.workload = SEWorkload.init_compatible(str(binary))
++
++process = Process()
++process.cmd = [
++    str(binary),
++    "--threads", str(args.threads),
++    "--alg", args.alg,
++    "--limiar", str(args.limiar),
++    "--work", str(args.work),
++    "--imbalance", str(args.imbalance),
++    "--iters", str(args.iters),
++    "--perturb", str(args.perturb),
++]
++
++for cpu in system.cpu:
++    cpu.workload = process
++    cpu.createThreads()
++
++root = Root(full_system=False, system=system)
++m5.instantiate()
++event = m5.simulate()
++print(f"Fim no tick {m5.curTick()}: {event.getCause()}")
+diff --git a/include/gem5/asm/generic/m5ops.h b/include/gem5/asm/generic/m5ops.h
+index e0633217ba..34ac1a0388 100644
+--- a/include/gem5/asm/generic/m5ops.h
++++ b/include/gem5/asm/generic/m5ops.h
+@@ -71,7 +71,8 @@
+ #define M5OP_RESERVED2          0x56 // Reserved for user
+ #define M5OP_RESERVED3          0x57 // Reserved for user
+ #define M5OP_RESERVED4          0x58 // Reserved for user
+-#define M5OP_RESERVED5          0x59 // Reserved for user
++/* Etapa 01 */
++#define M5OP_BARRIER            0x59 // Eventos de barreira
+ 
+ #define M5OP_WORK_BEGIN         0x5a
+ #define M5OP_WORK_END           0x5b
+@@ -110,6 +111,7 @@
+     M5OP(m5_dist_toggle_sync, M5OP_DIST_TOGGLE_SYNC)            \
+     M5OP(m5_workload, M5OP_WORKLOAD)                            \
+     M5OP(m5_hypercall, M5OP_HYPERCALL)                          \
++    M5OP(m5_barrier, M5OP_BARRIER)                              \
+ 
+ #define M5OP_MERGE_TOKENS_I(a, b) a##b
+ #define M5OP_MERGE_TOKENS(a, b) M5OP_MERGE_TOKENS_I(a, b)
+diff --git a/include/gem5/m5ops.h b/include/gem5/m5ops.h
+index 7985619788..bba96fc08a 100644
+--- a/include/gem5/m5ops.h
++++ b/include/gem5/m5ops.h
+@@ -67,6 +67,8 @@ void m5_panic(void);
+ void m5_work_begin(uint64_t workid, uint64_t threadid);
+ void m5_work_end(uint64_t workid, uint64_t threadid);
+ void m5_hypercall(uint64_t hypercall_id);
++/* Etapa 01 */
++void m5_barrier(uint64_t id, uint64_t fase);
+ /*
+  * Send a very generic poke to the workload so it can do something. It's up to
+  * the workload to know what information to look for to interpret an event,
+diff --git a/include/gem5/p02_barrier_events.h b/include/gem5/p02_barrier_events.h
+new file mode 100644
+index 0000000000..a98b585b21
+--- /dev/null
++++ b/include/gem5/p02_barrier_events.h
+@@ -0,0 +1,17 @@
++/* Etapa 01 */
++
++#ifndef GEM5_BARRIER_EVENTS_H
++#define GEM5_BARRIER_EVENTS_H
++
++#include <stdint.h>
++
++enum P02BarrierPhase : uint64_t
++{
++    P02_ARRIVE = 0,
++    P02_DEPART = 1,
++};
++
++// Identificador reservado às barreiras de controle da ROI.
++#define P02_BARRIER_CTRL 0
++
++#endif
+diff --git a/src/mem/cache/base.cc b/src/mem/cache/base.cc
+index f6563e176e..a070785eb6 100644
+--- a/src/mem/cache/base.cc
++++ b/src/mem/cache/base.cc
+@@ -453,6 +453,17 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
+ void
+ BaseCache::recvTimingReq(PacketPtr pkt)
+ {
++    /* Etapa 03 */
++    // P02: conta operações atômicas (uma por operação, não por acesso)
++    if ((*pkt).cmd == MemCmd::LockedRMWReadReq) {
++        stats.lockedRMWs[(*(*pkt).req).requestorId()]++;
++    }
++
++    // P02: conta operações atômicas executadas na cache.
++    if ((*pkt).isAtomicOp()) {
++        stats.amoOps[(*(*pkt).req).requestorId()]++;
++    }
++
+     // anything that is merely forwarded pays for the forward latency and
+     // the delay provided by the crossbar
+     Tick forward_time = clockEdge(forwardLatency) + pkt->headerDelay;
+@@ -2336,6 +2347,12 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
+              "number of data expansions"),
+     ADD_STAT(dataContractions, statistics::units::Count::get(),
+              "number of data contractions"),
++    ADD_STAT(lockedRMWs, statistics::units::Count::get(),
++             "P02: operações atômicas com trava recebidas por requisitante"),
++    ADD_STAT(amoOps, statistics::units::Count::get(),
++             "P02: operações atômicas executadas na cache por requisitante"),
++    ADD_STAT(snoopInvalidations, statistics::units::Count::get(),
++             "P02: blocos válidos invalidados por snoop"),
+     cmd(MemCmd::NUM_MEM_CMDS)
+ {
+     for (int idx = 0; idx < MemCmd::NUM_MEM_CMDS; ++idx)
+@@ -2352,6 +2369,19 @@ BaseCache::CacheStats::regStats()
+     System *system = cache.system;
+     const auto max_requestors = system->maxRequestors();
+ 
++    /* Etapa 03 */
++    // P02: contadores por requisitante.
++    lockedRMWs.init(max_requestors);
++    lockedRMWs.flags(total | nozero);
++
++    amoOps.init(max_requestors);
++    amoOps.flags(total | nozero);
++
++    for (int i = 0; i < max_requestors; i++) {
++        lockedRMWs.subname(i, (*system).getRequestorName(i));
++        amoOps.subname(i, (*system).getRequestorName(i));
++    }
++
+     for (auto &cs : cmd)
+         cs->regStatsFromParent();
+ 
+diff --git a/src/mem/cache/base.hh b/src/mem/cache/base.hh
+index df9e89efd8..c118745566 100644
+--- a/src/mem/cache/base.hh
++++ b/src/mem/cache/base.hh
+@@ -1144,6 +1144,16 @@ class BaseCache : public ClockedObject
+          */
+         statistics::Scalar dataContractions;
+ 
++        /* Etapa 03 */
++        /** P02: operações atômicas com trava recebidas, por requisitante. */
++        statistics::Vector lockedRMWs;
++
++        /** P02: operações atômicas executadas na cache, por requisitante. */
++        statistics::Vector amoOps;
++
++        /** P02: blocos válidos invalidados por snoop. */
++        statistics::Scalar snoopInvalidations;
++
+         /** Per-command statistics */
+         std::vector<std::unique_ptr<CacheCmdStats>> cmd;
+     } stats;
+diff --git a/src/mem/cache/cache.cc b/src/mem/cache/cache.cc
+index bcf38daf09..086b876114 100644
+--- a/src/mem/cache/cache.cc
++++ b/src/mem/cache/cache.cc
+@@ -1251,6 +1251,10 @@ Cache::handleSnoop(PacketPtr pkt, CacheBlk *blk, bool is_timing,
+     // Do this last in case it deallocates block data or something
+     // like that
+     if (blk_valid && invalidate) {
++        /* Etapa 03 */
++        // P02: conta invalidações efetivas
++        stats.snoopInvalidations++;
++
+         invalidateBlock(blk);
+         DPRINTF(Cache, "new state is %s\n", blk->print());
+     }
+diff --git a/src/projetos/p02/BarrierMonitor.py b/src/projetos/p02/BarrierMonitor.py
+new file mode 100644
+index 0000000000..09c7e86310
+--- /dev/null
++++ b/src/projetos/p02/BarrierMonitor.py
+@@ -0,0 +1,28 @@
++# Etapa 02
++
++from m5.params import *
++from m5.SimObject import SimObject
++
++
++class BarrierMonitor(SimObject):
++    type = "BarrierMonitor"
++    cxx_header = "projetos/p02/barrier_monitor.hh"
++    cxx_class = "gem5::BarrierMonitor"
++
++    participants = Param.Unsigned("Threads por episódio (P)")
++
++    max_barriers = Param.Unsigned(
++        4, "Quantidade de identificadores de barreira"
++    )
++
++    cpus = VectorParam.BaseCPU(
++        "CPUs observadas, na ordem dos contextos"
++    )
++
++    hist_max = Param.Tick(
++        1_000_000, "Limite superior dos histogramas, em ticks"
++    )
++
++    hist_buckets = Param.Unsigned(
++        100, "Quantidade de faixas dos histogramas"
++    )
+diff --git a/src/projetos/p02/SConscript b/src/projetos/p02/SConscript
+new file mode 100644
+index 0000000000..9e79c2d0c2
+--- /dev/null
++++ b/src/projetos/p02/SConscript
+@@ -0,0 +1,7 @@
++Import("*")
++
++SimObject("BarrierMonitor.py", sim_objects=["BarrierMonitor"])
++
++Source("barrier_monitor.cc")
++
++DebugFlag("BarrierMonitor")
+diff --git a/src/projetos/p02/barrier_monitor.cc b/src/projetos/p02/barrier_monitor.cc
+new file mode 100644
+index 0000000000..2c2c6a7b78
+--- /dev/null
++++ b/src/projetos/p02/barrier_monitor.cc
+@@ -0,0 +1,220 @@
++/* Etapa 02 */
++
++#include "projetos/p02/barrier_monitor.hh"
++#include "base/logging.hh"
++#include "cpu/base.hh"
++#include "cpu/thread_context.hh"
++#include <gem5/p02_barrier_events.h>
++
++namespace gem5
++{
++    BarrierMonitor *BarrierMonitor::_instance = nullptr;
++
++    BarrierMonitor::BarrierMonitor(const Params &params)
++        : SimObject(params),
++          numParticipants(params.participants),
++          stats(this, params.participants, params.max_barriers)
++    {
++        fatal_if(_instance != nullptr, "Já existe um BarrierMonitor.");
++
++        fatal_if(numParticipants == 0, "O número de participantes deve ser maior que zero.");
++
++        fatal_if(params.max_barriers == 0, "O número de barreiras deve ser maior que zero.");
++
++        episodes.resize(params.max_barriers);
++
++        ctxs.resize(numParticipants);
++
++        for (unsigned i = 0; i < numParticipants; i++) {
++            ctxs[i].resize(params.max_barriers);
++        }
++
++        _instance = this;
++    }
++
++    BarrierMonitor::~BarrierMonitor()
++    {
++        _instance = nullptr;
++    }
++
++    BarrierMonitor::MonitorStats::MonitorStats(
++        BarrierMonitor *monitor,
++        unsigned numContexts,
++        unsigned numBarriers
++    )
++        : statistics::Group(monitor),
++
++        ADD_STAT(barriersCompleted, statistics::units::Count::get(), "Barreiras concluídas"),
++        ADD_STAT(arrivals, statistics::units::Count::get(), "Chegadas por contexto"),
++        ADD_STAT(waitTicks, statistics::units::Tick::get(), "Tempo total de espera por contexto"),
++        ADD_STAT(waitDist, statistics::units::Tick::get(), "Tempos de espera"),
++        ADD_STAT(arrivalSpread, statistics::units::Tick::get(), "Dispersão das chegadas"),
++        ADD_STAT(releaseLatency, statistics::units::Tick::get(), "Latência de liberação"),
++        ADD_STAT(earlyDepartures, statistics::units::Count::get(), "Saídas antecipadas"),
++        ADD_STAT(invalidEvents, statistics::units::Count::get(), "Eventos inválidos"),
++        ADD_STAT(meanWait, statistics::units::Tick::get(), "Espera média")
++    {
++        barriersCompleted.init(numBarriers);
++        arrivals.init(numContexts);
++        waitTicks.init(numContexts);
++
++        Tick histMax = (*monitor).params().hist_max;
++        unsigned histBuckets = (*monitor).params().hist_buckets;
++
++        fatal_if(histMax == 0 || histBuckets == 0, "O limite e o número de faixas devem ser maiores que zero.");
++
++        Tick bucketSize = histMax / histBuckets;
++
++        if (histMax % histBuckets != 0) {
++            bucketSize++;
++        }
++
++        waitDist.init(0, histMax, bucketSize);
++        arrivalSpread.init(0, histMax, bucketSize);
++        releaseLatency.init(0, histMax, bucketSize);
++
++        meanWait = statistics::sum(waitTicks) / statistics::sum(arrivals);
++    }
++
++    void BarrierMonitor::startup()
++    {
++        SimObject::startup();
++
++        const Params &config  = (*this).params();
++
++        if (config.cpus.size() != numParticipants) {
++            fatal("A quantidade de CPUs deve ser igual a de participantes.");
++        }
++
++        for (int i = 0; i < numParticipants; i++) {
++            BaseCPU *cpu = config.cpus[i];
++
++            if (cpu == nullptr) {
++                fatal("Uma CPU da lista nao foi definida.");
++            }
++
++            if ((*cpu).numContexts() != 1) {
++                fatal("Cada CPU deve ter exatamente um contexto.");
++            }
++
++            ThreadContext *context = (*cpu).getContext(0);
++
++            if ((*context).contextId() != i) {
++                fatal("O identificador do contexto nao corresponde a ordem das CPUs.");
++            }
++        }
++    }
++
++    void BarrierMonitor::event(
++        ContextID ctx,
++        Tick when,
++        uint64_t id,
++        uint64_t phase
++    )
++    {
++        if (ctx >= ctxs.size()) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        if (id >= episodes.size()) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        if (phase == P02_ARRIVE) {
++            arrive(ctx, when, id);
++        } else if (phase == P02_DEPART) {
++            depart(ctx, when, id);
++        } else {
++            stats.invalidEvents++;
++        }
++    }
++
++    void BarrierMonitor::arrive(ContextID ctx, Tick when, unsigned id)
++    {
++        CtxBarrier &context = ctxs[ctx][id];
++
++        if (context.arrivals != context.departures) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        uint64_t episodeNumber = context.arrivals;
++
++        Episode &episode = episodes[id][episodeNumber % 2];
++
++        if (episode.inUse && episode.number != episodeNumber) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        if (!episode.inUse) {
++            episode = Episode{};
++            episode.inUse = true;
++            episode.number = episodeNumber;
++            episode.firstArrival = when;
++        }
++
++        episode.arrived++;
++        episode.lastArrival = when;
++
++        context.arriveTick = when;
++        context.arrivals++;
++
++        if (id != P02_BARRIER_CTRL) {
++            stats.arrivals[ctx]++;
++        }
++    }
++
++    void BarrierMonitor::depart(ContextID ctx, Tick when, unsigned id)
++    {
++        CtxBarrier &context = ctxs[ctx][id];
++
++        if (context.arrivals <= context.departures) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        uint64_t episodeNumber = context.departures;
++        Episode &episode = episodes[id][episodeNumber % 2];
++
++        if (!episode.inUse || episode.number != episodeNumber) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        if (when < context.arriveTick) {
++            stats.invalidEvents++;
++            return;
++        }
++
++        if (episode.arrived < numParticipants) {
++            stats.earlyDepartures++;
++        }
++
++        Tick wait = when - context.arriveTick;
++
++        if (id != P02_BARRIER_CTRL) {
++            stats.waitTicks[ctx] += wait;
++            stats.waitDist.sample(wait);
++        }
++
++        context.departures++;
++        episode.departed++;
++
++        if (episode.departed == numParticipants) {
++            stats.barriersCompleted[id]++;
++
++            if (id != P02_BARRIER_CTRL) {
++                Tick spread = episode.lastArrival - episode.firstArrival;
++                Tick release = when - episode.lastArrival;
++
++                stats.arrivalSpread.sample(spread);
++                stats.releaseLatency.sample(release);
++            }
++
++            episode.inUse = false;
++        }
++    }
++}
+diff --git a/src/projetos/p02/barrier_monitor.hh b/src/projetos/p02/barrier_monitor.hh
+new file mode 100644
+index 0000000000..0e7ebc386b
+--- /dev/null
++++ b/src/projetos/p02/barrier_monitor.hh
+@@ -0,0 +1,88 @@
++/* Etapa 02 */
++
++#ifndef GEM5_BARRIER_MONITOR_HH
++#define GEM5_BARRIER_MONITOR_HH
++
++#include <array>
++#include <vector>
++
++#include "base/statistics.hh"
++#include "base/types.hh"
++#include "params/BarrierMonitor.hh"
++#include "sim/sim_object.hh"
++
++namespace gem5
++{
++
++    class BarrierMonitor : public SimObject
++    {
++      public:
++        PARAMS(BarrierMonitor);
++
++        BarrierMonitor(const Params &params);
++        ~BarrierMonitor() override;
++
++        static BarrierMonitor *instance()
++        {
++            return _instance;
++        }
++
++        void event(ContextID ctx, Tick when, uint64_t id, uint64_t fase);
++
++        void startup() override;
++
++      private:
++        static BarrierMonitor *_instance;
++
++        const unsigned numParticipants;
++
++        struct Episode
++        {
++            bool inUse = false;
++            uint64_t number = 0;
++
++            unsigned arrived = 0;
++            unsigned departed = 0;
++
++            Tick firstArrival = 0;
++            Tick lastArrival = 0;
++        };
++
++        std::vector<std::array<Episode, 2>> episodes;
++
++        struct CtxBarrier
++        {
++            uint64_t arrivals = 0;
++            uint64_t departures = 0;
++
++            Tick arriveTick = 0;
++        };
++
++        std::vector<std::vector<CtxBarrier>> ctxs;
++
++        void arrive(ContextID ctx, Tick when, unsigned id);
++        void depart(ContextID ctx, Tick when, unsigned id);
++
++        struct MonitorStats : public statistics::Group
++        {
++            MonitorStats(BarrierMonitor *parent, unsigned n, unsigned b);
++
++            statistics::Vector barriersCompleted;
++            statistics::Vector arrivals;
++            statistics::Vector waitTicks;
++
++            statistics::Distribution waitDist;
++            statistics::Distribution arrivalSpread;
++            statistics::Distribution releaseLatency;
++
++            statistics::Scalar earlyDepartures;
++            statistics::Scalar invalidEvents;
++
++            statistics::Formula meanWait;
++        };
++
++        MonitorStats stats;
++    };
++}
++
++#endif
+diff --git a/src/sim/pseudo_inst.cc b/src/sim/pseudo_inst.cc
+index adc66d1c84..db97eff08e 100644
+--- a/src/sim/pseudo_inst.cc
++++ b/src/sim/pseudo_inst.cc
+@@ -70,6 +70,8 @@
+ #include "sim/stat_control.hh"
+ #include "sim/stats.hh"
+ #include "sim/system.hh"
++#include <gem5/p02_barrier_events.h>
++#include "projetos/p02/barrier_monitor.hh"
+ 
+ namespace gem5
+ {
+@@ -488,6 +490,24 @@ triggerWorkloadEvent(ThreadContext *tc)
+     tc->getSystemPtr()->workload->event(tc);
+ }
+ 
++/* Etapa 01 */
++void barrierEvent(ThreadContext *tc, uint64_t id, uint64_t phase)
++{
++    DPRINTF(PseudoInst, "barrierEvent(%llu, %llu)\n", id, phase);
++
++    BarrierMonitor *monitor = BarrierMonitor::instance();
++
++    if (monitor == nullptr) {
++        warn_once("m5_barrier: BarrierMonitor ausente; evento ignorado.\n");
++        return;
++    }
++
++    ContextID ctx = (*tc).contextId();
++    Tick when = curTick();
++
++    (*monitor).event(ctx, when, id, phase);
++}
++
+ //
+ // This function is executed when annotated work items begin.  Depending on
+ // what the user specified at the command line, the simulation may exit and/or
+diff --git a/src/sim/pseudo_inst.hh b/src/sim/pseudo_inst.hh
+index 6815e1160b..c588be459e 100644
+--- a/src/sim/pseudo_inst.hh
++++ b/src/sim/pseudo_inst.hh
+@@ -114,6 +114,8 @@ void m5Syscall(ThreadContext *tc);
+ void togglesync(ThreadContext *tc);
+ void triggerWorkloadEvent(ThreadContext *tc);
+ void m5Hypercall(ThreadContext *tc, uint64_t hypercall_id);
++/* Etapa 01 */
++void barrierEvent(ThreadContext *tc, uint64_t id, uint64_t phase);
+ 
+ /**
+  * Execute a decoded M5 pseudo instruction
+@@ -233,11 +235,15 @@ pseudoInstWork(ThreadContext *tc, uint8_t func, uint64_t &result)
+         invokeSimcall<ABI>(tc, workend);
+         return true;
+ 
++      /* Etapa 01 */
++      case M5OP_BARRIER:
++          invokeSimcall<ABI>(tc, barrierEvent);
++          return true;
++
+       case M5OP_RESERVED1:
+       case M5OP_RESERVED2:
+       case M5OP_RESERVED3:
+       case M5OP_RESERVED4:
+-      case M5OP_RESERVED5:
+         warn("Unimplemented m5 op (%#x)\n", func);
+         return false;
+ 
+diff --git a/workloads/p02/barreira.cc b/workloads/p02/barreira.cc
+new file mode 100644
+index 0000000000..ddc805b3c9
+--- /dev/null
++++ b/workloads/p02/barreira.cc
+@@ -0,0 +1,30 @@
++#include "barreira.h"
++#include "central.h"
++#include "dissem.h"
++
++std::unique_ptr<Barrier>
++createBarrier(
++    Algorithm algorithm,
++    unsigned numParticipants,
++    uint64_t id,
++    unsigned threshold
++)
++{
++    if (algorithm == Algorithm::Auto) {
++        if (numParticipants >= threshold) {
++            algorithm = Algorithm::Dissem;
++        } else {
++            algorithm = Algorithm::Central;
++        }
++    }
++
++    if (algorithm == Algorithm::Central) {
++        return std::make_unique<CentralBarrier>(numParticipants, id);
++    }
++
++    if (algorithm == Algorithm::Dissem) {
++        return std::make_unique<DisseminationBarrier>(numParticipants, id);
++    }
++
++    return nullptr;
++}
+diff --git a/workloads/p02/barreira.h b/workloads/p02/barreira.h
+new file mode 100644
+index 0000000000..0050dc5297
+--- /dev/null
++++ b/workloads/p02/barreira.h
+@@ -0,0 +1,59 @@
++/* Etapa 04 */
++
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++
++#include <gem5/p02_barrier_events.h>
++
++#ifdef USE_M5OPS
++#include <gem5/m5ops.h>
++#define P02_EVENT(id, phase) m5_barrier((id), (phase))
++#else
++#define P02_EVENT(id, phase) ((void)0)
++#endif
++
++constexpr std::size_t CACHE_LINE = 64;
++
++enum class Algorithm
++{
++    Central,
++    Dissem,
++    Auto
++};
++
++class Barrier
++{
++  public:
++    Barrier(unsigned numParticipants, uint64_t id)
++        : numParticipants(numParticipants), id(id)
++    {
++    }
++
++    virtual ~Barrier() = default;
++
++    void wait(unsigned tid)
++    {
++        P02_EVENT(id, P02_ARRIVE);
++
++        waitImpl(tid);
++
++        P02_EVENT(id, P02_DEPART);
++    }
++
++  protected:
++    virtual void waitImpl(unsigned tid) = 0;
++
++    const unsigned numParticipants;
++    const uint64_t id;
++};
++
++std::unique_ptr<Barrier> createBarrier(
++    Algorithm algorithm,
++    unsigned numParticipants,
++    uint64_t id,
++    unsigned threshold
++);
+diff --git a/workloads/p02/central.cc b/workloads/p02/central.cc
+new file mode 100644
+index 0000000000..b607b6e9f8
+--- /dev/null
++++ b/workloads/p02/central.cc
+@@ -0,0 +1,11 @@
++/* Etapa 04 */
++
++#include "central.h"
++
++CentralBarrier::CentralBarrier(unsigned numParticipants, uint64_t id)
++    : Barrier(numParticipants, id),
++      counter(numParticipants),
++      sense(0)
++{
++    localSense = std::make_unique<ThreadSense[]>(numParticipants);
++}
+diff --git a/workloads/p02/central.h b/workloads/p02/central.h
+new file mode 100644
+index 0000000000..a7efa75bad
+--- /dev/null
++++ b/workloads/p02/central.h
+@@ -0,0 +1,42 @@
++/* Etapa 04 */
++
++#pragma once
++#include "barreira.h"
++
++class CentralBarrier : public Barrier
++{
++  public:
++    CentralBarrier(unsigned numParticipants, uint64_t id);
++
++  protected:
++    void waitImpl(unsigned tid) override
++    {
++        // Inverte o sentido
++        localSense[tid].value = 1 - localSense[tid].value;
++
++        // Decrementa o contador
++        unsigned previous = counter.fetch_sub(
++            1, std::memory_order_acq_rel
++        );
++
++        if (previous == 1) {
++            // Restaura o contador
++            counter.store(numParticipants, std::memory_order_relaxed);
++            sense.store(localSense[tid].value, std::memory_order_release);
++        } else {
++            // Espera até observar o sentido deste episódio.
++            while (sense.load(std::memory_order_acquire) != localSense[tid].value) { }
++        }
++    }
++
++  private:
++    alignas(CACHE_LINE) std::atomic<unsigned> counter;
++    alignas(CACHE_LINE) std::atomic<unsigned> sense;
++
++    struct alignas(CACHE_LINE) ThreadSense
++    {
++        unsigned value = 0;
++    };
++
++    std::unique_ptr<ThreadSense[]> localSense;
++};
+diff --git a/workloads/p02/dissem.cc b/workloads/p02/dissem.cc
+new file mode 100644
+index 0000000000..d89a05e360
+--- /dev/null
++++ b/workloads/p02/dissem.cc
+@@ -0,0 +1,61 @@
++/* Etapa 05 */
++
++#include "dissem.h"
++
++DisseminationBarrier::DisseminationBarrier(unsigned numParticipants, uint64_t id)
++    : Barrier(numParticipants, id),
++      rounds(0),
++      threads(numParticipants)
++{
++    uint64_t distance = 1;
++
++    while (distance < numParticipants) {
++        rounds++;
++        distance *= 2;
++    }
++
++    for (unsigned tid = 0; tid < numParticipants; tid++) {
++        ThreadData &thread = threads[tid];
++
++        for (unsigned parity = 0; parity < 2; parity++) {
++            thread.flags[parity] = std::make_unique<Flag[]>(rounds);
++            thread.partners[parity].resize(rounds);
++        }
++    }
++
++    for (unsigned tid = 0; tid < numParticipants; tid++) {
++        ThreadData &thread = threads[tid];
++        distance = 1;
++
++        for (unsigned round = 0; round < rounds; round++) {
++            unsigned partner = (tid + distance) % numParticipants;
++
++            for (unsigned parity = 0; parity < 2; parity++) {
++                thread.partners[parity][round] = &threads[partner].flags[parity][round];
++            }
++
++            distance *= 2;
++        }
++    }
++}
++
++void DisseminationBarrier::waitImpl(unsigned tid)
++{
++    ThreadData &thread = threads[tid];
++    unsigned parity = thread.parity;
++
++    for (unsigned round = 0; round < rounds; round++) {
++        Flag *partner = thread.partners[parity][round];
++        Flag &flag = thread.flags[parity][round];
++
++        (*partner).value.store(thread.sense, std::memory_order_release);
++
++        while (flag.value.load(std::memory_order_acquire) != thread.sense) { }
++    }
++
++    if (parity == 1) {
++        thread.sense = 1 - thread.sense;
++    }
++
++    thread.parity = 1 - parity;
++}
+diff --git a/workloads/p02/dissem.h b/workloads/p02/dissem.h
+new file mode 100644
+index 0000000000..3128633720
+--- /dev/null
++++ b/workloads/p02/dissem.h
+@@ -0,0 +1,32 @@
++/* Etapa 05 */
++
++#pragma once
++#include <vector>
++#include "barreira.h"
++
++class DisseminationBarrier : public Barrier
++{
++  public:
++    DisseminationBarrier(unsigned numParticipants, uint64_t id);
++
++  protected:
++    void waitImpl(unsigned tid) override;
++
++  private:
++    struct alignas(CACHE_LINE) Flag
++    {
++        std::atomic<unsigned> value{0};
++    };
++
++    struct alignas(CACHE_LINE) ThreadData
++    {
++        std::unique_ptr<Flag[]> flags[2];
++        std::vector<Flag *> partners[2];
++
++        unsigned parity = 0;
++        unsigned sense = 1;
++    };
++
++    unsigned rounds;
++    std::vector<ThreadData> threads;
++};
+diff --git a/workloads/p02/micro.cc b/workloads/p02/micro.cc
+new file mode 100644
+index 0000000000..5f1f39a8bc
+--- /dev/null
++++ b/workloads/p02/micro.cc
+@@ -0,0 +1,218 @@
++/* Listagem 11.13 */
++/* 11.9 */
++
++#include <cstdint>
++#include <iostream>
++#include <random>
++#include <thread>
++#include <vector>
++#include <functional>
++#include <sstream>
++#include <string>
++#include "central.h"
++
++struct Params
++{
++    unsigned numThreads = 4;
++    unsigned iterations = 100;
++    unsigned warmup = 10;
++
++    uint64_t work = 1000;
++    double imbalance = 0.0;
++    uint64_t seed = 1;
++    Algorithm algorithm = Algorithm::Central;
++    unsigned threshold = 0;
++};
++
++uint64_t
++syntheticWork(
++    unsigned tid,
++    const Params &params,
++    std::mt19937 &generator
++)
++{
++    uint64_t n = params.work;
++
++    if (params.imbalance > 0 && n > 0) {
++        std::uniform_real_distribution<double> distribution(0.0, 1.0);
++        double u = distribution(generator);
++        n += static_cast<uint64_t>(n * params.imbalance * u);
++    }
++
++    uint64_t acc = tid + 1;
++
++    for (uint64_t k = 0; k < n; k++) {
++        acc = acc * 3 + k;
++    }
++
++    return acc;
++}
++
++void participant(
++    unsigned tid,
++    const Params &params,
++    Barrier &measured,
++    Barrier &control,
++    uint64_t &result
++)
++{
++    std::mt19937 generator(params.seed + tid);
++    uint64_t total = 0;
++
++    // Aquecimento
++    for (unsigned i = 0; i < params.warmup; i++) {
++        total += syntheticWork(tid, params, generator);
++        measured.wait(tid);
++    }
++
++    control.wait(tid);
++
++#ifdef USE_M5OPS
++    if (tid == 0) {
++        m5_reset_stats(0, 0);
++    }
++#endif
++
++    control.wait(tid);
++
++    // Região de interesse.
++    for (unsigned i = 0; i < params.iterations; i++) {
++        total += syntheticWork(tid, params, generator);
++        measured.wait(tid);
++    }
++
++    control.wait(tid);
++
++#ifdef USE_M5OPS
++    if (tid == 0) {
++        m5_dump_stats(0, 0);
++    }
++#endif
++
++    result = total;
++}
++
++int main(int argc, char *argv[])
++{
++    Params params;
++
++    for (int i = 1; i < argc; i += 2) {
++        std::string option = argv[i];
++
++        if (option == "--help") {
++            std::cout
++                << "Opções: --threads N --iters N --work N "
++                << "--imbalance F --perturb N "
++                << "--alg central|dissem|auto --limiar N\n";
++            return 0;
++        }
++
++        if (i + 1 >= argc) {
++            std::cerr << "Falta o valor de " << option << "\n";
++            return 1;
++        }
++
++        std::string text = argv[i + 1];
++
++        if (option == "--alg") {
++            if (text == "central") {
++                params.algorithm = Algorithm::Central;
++            } else if (text == "dissem") {
++                params.algorithm = Algorithm::Dissem;
++            } else if (text == "auto") {
++                params.algorithm = Algorithm::Auto;
++            } else {
++                std::cerr << "Algoritmo inválido: " << text << "\n";
++                return 1;
++            }
++
++            continue;
++        }
++
++        std::istringstream value(text);
++
++        if (text.empty() || text[0] == '-') {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++
++        if (option == "--threads") {
++            value >> params.numThreads;
++        } else if (option == "--iters") {
++            value >> params.iterations;
++        } else if (option == "--work") {
++            value >> params.work;
++        } else if (option == "--imbalance") {
++            value >> params.imbalance;
++        } else if (option == "--perturb") {
++            value >> params.seed;
++        } else if (option == "--limiar") {
++            value >> params.threshold;
++        } else {
++            std::cerr << "Opção desconhecida: " << option << "\n";
++            return 1;
++        }
++
++        if (value.fail() || !value.eof()) {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++    }
++
++    if (params.numThreads == 0 || params.iterations == 0) {
++        std::cerr << "Threads e iterações devem ser maiores que zero.\n";
++        return 1;
++    }
++
++    if (params.algorithm == Algorithm::Auto && params.threshold == 0) {
++        std::cerr << "Informe --limiar maior que zero para usar auto.\n";
++        return 1;
++    }
++
++    std::unique_ptr<Barrier> measured = createBarrier(
++        params.algorithm,
++        params.numThreads,
++        1,
++        params.threshold
++    );
++
++    if (!measured) {
++        std::cerr << "Não foi possível criar a barreira.\n";
++        return 1;
++    }
++
++    CentralBarrier control(params.numThreads, P02_BARRIER_CTRL);
++
++    std::vector<uint64_t> results(params.numThreads, 0);
++    std::vector<std::thread> threads;
++
++    for (unsigned tid = 1; tid < params.numThreads; tid++) {
++        threads.emplace_back(
++            participant,
++            tid,
++            std::cref(params),
++            std::ref(*measured),
++            std::ref(control),
++            std::ref(results[tid])
++        );
++    }
++
++    participant(0, params, *measured, control, results[0]);
++
++    for (std::thread &thread : threads) {
++        thread.join();
++    }
++
++    uint64_t total = 0;
++
++    for (unsigned tid = 0; tid < params.numThreads; tid++) {
++        total += results[tid];
++    }
++
++    std::cout << "Threads: " << params.numThreads << "\n";
++    std::cout << "Iterações medidas: " << params.iterations << "\n";
++    std::cout << "Episódios medidos: " << params.iterations << "\n";
++    std::cout << "Resultado: " << total << "\n";
++
++    return 0;
++}
+diff --git a/workloads/p02/teste_m5_barrier.cc b/workloads/p02/teste_m5_barrier.cc
+new file mode 100644
+index 0000000000..bc47eec765
+--- /dev/null
++++ b/workloads/p02/teste_m5_barrier.cc
+@@ -0,0 +1,10 @@
++#include <gem5/m5ops.h>
++#include <gem5/p02_barrier_events.h>
++
++int main()
++{
++    m5_barrier(1, P02_ARRIVE);
++    m5_barrier(1, P02_DEPART);
++
++    return 0;
++}
+diff --git a/workloads/p02/teste_monitor.cc b/workloads/p02/teste_monitor.cc
+new file mode 100644
+index 0000000000..cda6cd23f7
+--- /dev/null
++++ b/workloads/p02/teste_monitor.cc
+@@ -0,0 +1,54 @@
++#include <pthread.h>
++#include <string>
++#include <thread>
++
++#include <gem5/m5ops.h>
++#include <gem5/p02_barrier_events.h>
++
++pthread_barrier_t barrier;
++bool useBarrier = false;
++
++void participant(unsigned tid)
++{
++    if (tid == 1) {
++        for (volatile unsigned i = 0; i < 100000; i++) {
++        }
++    }
++
++    for (unsigned i = 0; i < 10; i++) {
++        m5_barrier(1, P02_ARRIVE);
++
++        if (useBarrier) {
++            pthread_barrier_wait(&barrier);
++        }
++
++        m5_barrier(1, P02_DEPART);
++    }
++}
++
++int main(int argc, char *argv[])
++{
++    if (argc == 2 && std::string(argv[1]) == "--com-barreira") {
++        useBarrier = true;
++    }
++
++    if (useBarrier) {
++        int result = pthread_barrier_init(&barrier, nullptr, 2);
++
++        if (result != 0) {
++            return 1;
++        }
++    }
++
++    std::thread worker(participant, 1);
++
++    participant(0);
++
++    worker.join();
++
++    if (useBarrier) {
++        pthread_barrier_destroy(&barrier);
++    }
++
++    return 0;
++}

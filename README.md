@@ -1,11 +1,13 @@
 # gem5 Adaptive Barrier
 
 `alteracoes-gem5.patch` implementa o núcleo do Projeto 2. Aplique
-`complemento-p02.patch` em seguida, ambos sobre o commit de `versao-base.txt`.
+`complemento-p02.patch` e `fix-teste-smoke.patch` em seguida, todos sobre o
+commit de `versao-base.txt`.
 
 ```sh
 git apply alteracoes-gem5.patch
 git apply complemento-p02.patch
+git apply fix-teste-smoke.patch
 cd workloads/p02 && make
 ./barrier_stress
 python ../../configs/projetos/p02/campanha_p02.py ../../build/X86/gem5.opt --dry-run

@@ -1,6 +1,6 @@
 diff --git a/configs/barreira/teste_m5_barreira.py b/configs/barreira/teste_m5_barreira.py
 new file mode 100644
-index 0000000000..bcf68ee259
+index 0000000000..b9dad2a246
 --- /dev/null
 +++ b/configs/barreira/teste_m5_barreira.py
 @@ -0,0 +1,79 @@
@@ -28,7 +28,7 @@ index 0000000000..bcf68ee259
 +
 +# Localiza o executável a partir da localização deste script.
 +raiz = Path(__file__).resolve().parents[2]
-+binario = raiz / "workloads/p02/teste_m5_barrier"
++binario = raiz / "workloads/p02/bin/teste_m5_barrier"
 +
 +system = System()
 +
@@ -85,18 +85,21 @@ index 0000000000..bcf68ee259
 +print(f"Motivo: {evento.getCause()}")
 diff --git a/configs/barreira/teste_monitor.py b/configs/barreira/teste_monitor.py
 new file mode 100644
-index 0000000000..a9f1f7654d
+index 0000000000..e1d2fd42c2
 --- /dev/null
 +++ b/configs/barreira/teste_monitor.py
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,129 @@
++import argparse
 +from pathlib import Path
 +
 +import m5
 +from m5.objects import (
 +    AddrRange,
 +    BarrierMonitor,
++    Cache,
 +    DDR3_1600_8x8,
 +    MemCtrl,
++    L2XBar,
 +    Process,
 +    Root,
 +    SEWorkload,
@@ -107,11 +110,36 @@ index 0000000000..a9f1f7654d
 +    VoltageDomain,
 +)
 +
++parser = argparse.ArgumentParser()
++parser.add_argument("--use-barrier", action="store_true")
++args = parser.parse_args()
++
 +root_dir = Path(__file__).resolve().parents[2]
-+binary = root_dir / "workloads/p02/teste_monitor"
++binary = root_dir / "workloads/p02/bin/teste_monitor"
 +
 +if not binary.is_file():
 +    raise FileNotFoundError(f"Programa não encontrado: {binary}")
++
++
++# Mesmos parâmetros usados em sistema_p02.py.
++class L1Cache(Cache):
++    assoc = 2
++    tag_latency = 2
++    data_latency = 2
++    response_latency = 2
++    mshrs = 4
++    tgts_per_mshr = 20
++
++
++class L2Cache(Cache):
++    size = "256KiB"
++    assoc = 8
++    tag_latency = 20
++    data_latency = 20
++    response_latency = 20
++    mshrs = 20
++    tgts_per_mshr = 12
++
 +
 +system = System()
 +
@@ -122,6 +150,7 @@ index 0000000000..a9f1f7654d
 +
 +system.mem_mode = "timing"
 +system.mem_ranges = [AddrRange("512MiB")]
++system.cache_line_size = 64
 +
 +system.cpu = [
 +    TimingSimpleCPU(cpu_id=0),
@@ -129,11 +158,26 @@ index 0000000000..a9f1f7654d
 +]
 +
 +system.membus = SystemXBar()
++system.l2bus = L2XBar()
 +system.system_port = system.membus.cpu_side_ports
 +
++system.l2 = L2Cache()
++system.l2.cpu_side = system.l2bus.mem_side_ports
++system.l2.mem_side = system.membus.cpu_side_ports
++
 +for cpu in system.cpu:
-+    cpu.icache_port = system.membus.cpu_side_ports
-+    cpu.dcache_port = system.membus.cpu_side_ports
++    cpu.icache = L1Cache(size="16KiB", is_read_only=True)
++    cpu.dcache = L1Cache(size="64KiB")
++
++    cpu.icache_port = cpu.icache.cpu_side
++    cpu.dcache_port = cpu.dcache.cpu_side
++    cpu.icache.mem_side = system.l2bus.cpu_side_ports
++    cpu.dcache.mem_side = system.l2bus.cpu_side_ports
++
++    cpu.mmu.connectWalkerPorts(
++        system.l2bus.cpu_side_ports,
++        system.l2bus.cpu_side_ports,
++    )
 +
 +    cpu.createInterruptController()
 +    cpu.interrupts[0].pio = system.membus.mem_side_ports
@@ -147,8 +191,13 @@ index 0000000000..a9f1f7654d
 +
 +system.workload = SEWorkload.init_compatible(str(binary))
 +
++command = [str(binary)]
++
++if args.use_barrier:
++    command.append("--use-barrier")
++
 +process = Process()
-+process.cmd = [str(binary)]
++process.cmd = command
 +
 +for cpu in system.cpu:
 +    cpu.workload = process
@@ -163,15 +212,203 @@ index 0000000000..a9f1f7654d
 +
 +m5.instantiate()
 +
-+print("Iniciando teste do monitor com duas threads...")
++print("Iniciando teste do monitor")
 +
 +event = m5.simulate(100_000_000_000)
 +
 +print(f"Simulação encerrada no tick {m5.curTick()}.")
 +print(f"Motivo: {event.getCause()}")
+diff --git a/configs/projetos/p02/campanha_p02.py b/configs/projetos/p02/campanha_p02.py
+new file mode 100644
+index 0000000000..05ea2ad655
+--- /dev/null
++++ b/configs/projetos/p02/campanha_p02.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++"""Executa a matriz mínima do Projeto 2 e registra cada comando em JSONL."""
++import argparse
++import itertools
++import json
++import subprocess
++from pathlib import Path
++
++
++def combinations():
++    for algorithm, threads, perturb in itertools.product(("central", "dissem"), (1, 2, 4, 8, 16), (1, 2, 3)):
++        for work, imbalance in itertools.product((0, 1000, 10000), (0.0, 0.5)):
++            yield "micro", algorithm, threads, work, imbalance, perturb, "timing"
++        for size in (128, 512):
++            yield "jacobi", algorithm, threads, size, 0.0, perturb, "timing"
++        yield "integ", algorithm, threads, 10000, 0.0, perturb, "timing"
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("gem5", type=Path)
++    parser.add_argument("--out", type=Path, default=Path("m5out/p02"))
++    parser.add_argument("--limiar", type=int, default=8)
++    parser.add_argument("--dry-run", action="store_true")
++    args = parser.parse_args()
++    script = Path(__file__).with_name("sistema_p02.py")
++    args.out.mkdir(parents=True, exist_ok=True)
++    log = args.out / "commands.jsonl"
++    with log.open("w") as output:
++        for index, (program, algorithm, threads, work, imbalance, perturb, cpu) in enumerate(combinations()):
++            run = args.out / f"{index:03d}-{program}-{algorithm}-p{threads}-w{work}-s{perturb}"
++            command = [str(args.gem5), "-d", str(run), str(script), "--threads", str(threads),
++                       "--alg", algorithm, "--limiar", str(args.limiar), "--prog", program,
++                       "--work", str(work), "--imbalance", str(imbalance), "--iters", "100",
++                       "--perturb", str(perturb), "--cpu", cpu]
++            output.write(json.dumps({"dir": str(run), "command": command}) + "\n")
++            output.flush()
++            if not args.dry_run:
++                subprocess.run(command, check=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/configs/projetos/p02/extrai_p02.py b/configs/projetos/p02/extrai_p02.py
+new file mode 100644
+index 0000000000..001847783b
+--- /dev/null
++++ b/configs/projetos/p02/extrai_p02.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++"""Lê a região medida e confere os contadores do monitor."""
++import argparse
++import configparser
++import csv
++import math
++import shlex
++from pathlib import Path
++
++
++def read_stats(path):
++    stats = {}
++    reading = False
++    for line in path.read_text(errors="replace").splitlines():
++        if "Begin Simulation Statistics" in line:
++            if reading:
++                raise ValueError("Bloco de estatísticas incompleto.")
++            reading = True
++        elif "End Simulation Statistics" in line and reading:
++            # Primeiro dump: região medida. O dump final inclui o encerramento.
++            return stats
++        elif reading:
++            parts = line.split()
++            if len(parts) >= 2 and not line.lstrip().startswith("#"):
++                try:
++                    stats[parts[0]] = float(parts[1])
++                except ValueError:
++                    raise ValueError(f"Estatística inválida: {line}")
++    raise ValueError("Nenhum bloco completo de estatísticas.")
++
++
++def read_options(path):
++    config = configparser.ConfigParser(interpolation=None)
++    config.read(path, encoding="utf-8")
++    for section in config.sections():
++        if config[section].get("type") == "Process":
++            command = shlex.split(config[section]["cmd"])
++            options = dict(zip(command[1::2], command[2::2]))
++            options["program"] = Path(command[0]).name
++            return options
++    raise ValueError("Processo não encontrado no config.ini.")
++
++
++def extract(path):
++    stats = read_stats(path)
++    options = read_options(path.parent / "config.ini")
++    program = options["program"]
++    if program not in ("micro", "jacobi", "integ"):
++        raise ValueError("Esta extração espera micro, jacobi ou integ com eventos.")
++
++    threads = int(options["--threads"])
++    iters = int(options["--iters"])
++    if threads <= 0 or iters <= 0:
++        raise ValueError("Threads e iterações devem ser positivas.")
++    expected = iters * 2 if program == "integ" else iters
++    monitor = "system.barrier_monitor."
++
++    episodes = stats[monitor + "barriersCompleted::1"]
++    early = stats[monitor + "earlyDepartures"]
++    invalid = stats[monitor + "invalidEvents"]
++    arrivals = [stats[monitor + f"arrivals::{tid}"] for tid in range(threads)]
++    release_samples = stats[monitor + "releaseLatency::samples"]
++    wait_samples = stats[monitor + "waitDist::samples"]
++
++    errors = []
++    if early != 0 or invalid != 0:
++        errors.append("Monitor detectou erros")
++    if episodes != expected:
++        errors.append("Quantidade de episódios incorreta")
++    if any(count != expected for count in arrivals):
++        errors.append("Quantidade de chegadas incorreta")
++    if release_samples != expected or wait_samples != threads * expected:
++        errors.append("Quantidade de amostras incorreta")
++    if stats["simTicks"] <= 0 or not math.isfinite(stats["simTicks"]):
++        errors.append("Tempo inválido")
++
++    row = {
++        "program": program, "threads": threads, "iters": iters,
++        "algorithm": options["--alg"], "work": options["--work"],
++        "imbalance": options["--imbalance"], "perturb": options["--perturb"],
++        "monitor_ok": int(not errors), "error": "; ".join(errors),
++        "sim_ticks": stats["simTicks"], "ticks_per_iteration": stats["simTicks"] / iters,
++        "episodes": episodes, "arrivals_per_thread": ";".join(str(int(n)) for n in arrivals),
++        "early_departures": early, "invalid_events": invalid,
++        "wait_mean": stats[monitor + "waitDist::mean"],
++        "arrival_spread_mean": stats[monitor + "arrivalSpread::mean"],
++        "release_latency_mean": stats[monitor + "releaseLatency::mean"],
++    }
++    wait = sum(stats[monitor + f"waitTicks::{tid}"] for tid in range(threads))
++    row["wait_fraction"] = wait / (threads * stats["simTicks"]) if not errors else ""
++
++    # Usa somente os totais, sem somá-los novamente com os requisitantes.
++    for level in ("l1d", "l2"):
++        caches = [f"system.cpu{tid}.dcache." for tid in range(threads)] if level == "l1d" else ["system.l2."]
++        for metric in ("lockedRMWs::total", "amoOps::total", "snoopInvalidations", "demandMisses::total"):
++            count = 0
++            for cache in caches:
++                if cache + "snoopInvalidations" not in stats:
++                    raise ValueError(f"Cache ou contadores ausentes: {cache}")
++                # Vetores com nozero podem omitir totais iguais a zero.
++                count += stats.get(cache + metric, 0)
++            row[level + "_" + metric.split("::")[0] + "_per_episode"] = count / expected
++    return row
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("root", type=Path)
++    parser.add_argument("--csv", type=Path, default=Path("p02.csv"))
++    args = parser.parse_args()
++    paths = [args.root / "stats.txt"] if (args.root / "stats.txt").is_file() else sorted(args.root.glob("*/stats.txt"))
++    if not paths:
++        parser.error("Nenhum stats.txt encontrado.")
++    rows = []
++    for path in paths:
++        row = {"run": path.parent.name}
++        try:
++            row.update(extract(path))
++        except (OSError, ValueError, KeyError, configparser.Error) as error:
++            row.update(monitor_ok=0, error=str(error))
++        rows.append(row)
++    columns = list(dict.fromkeys(key for row in rows for key in row))
++    with args.csv.open("w", newline="", encoding="utf-8") as output:
++        writer = csv.DictWriter(output, fieldnames=columns)
++        writer.writeheader()
++        writer.writerows(rows)
++    print(f"CSV salvo em {args.csv}")
++    if any(not row["monitor_ok"] for row in rows):
++        raise SystemExit("Há execuções com erro; consulte o CSV.")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/configs/projetos/p02/sistema_p02.py b/configs/projetos/p02/sistema_p02.py
 new file mode 100644
-index 0000000000..3bd372abaf
+index 0000000000..841f032892
 --- /dev/null
 +++ b/configs/projetos/p02/sistema_p02.py
 @@ -0,0 +1,152 @@
@@ -225,7 +462,7 @@ index 0000000000..3bd372abaf
 +    parser.error("O limiar deve ser maior que zero para usar auto.")
 +
 +root_dir = Path(__file__).resolve().parents[3]
-+binary = root_dir / "workloads/p02" / args.prog
++binary = root_dir / "workloads/p02/bin" / args.prog
 +
 +if not binary.is_file():
 +    parser.error(f"Programa não encontrado: {binary}. Compile o workload primeiro.")
@@ -478,22 +715,21 @@ index bcf38daf09..086b876114 100644
      }
 diff --git a/src/projetos/p02/BarrierMonitor.py b/src/projetos/p02/BarrierMonitor.py
 new file mode 100644
-index 0000000000..09c7e86310
+index 0000000000..0c5ee702ea
 --- /dev/null
 +++ b/src/projetos/p02/BarrierMonitor.py
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,27 @@
 +# Etapa 02
 +
 +from m5.params import *
 +from m5.SimObject import SimObject
-+
 +
 +class BarrierMonitor(SimObject):
 +    type = "BarrierMonitor"
 +    cxx_header = "projetos/p02/barrier_monitor.hh"
 +    cxx_class = "gem5::BarrierMonitor"
 +
-+    participants = Param.Unsigned("Threads por episódio (P)")
++    participants = Param.Unsigned("Threads por episódio")
 +
 +    max_barriers = Param.Unsigned(
 +        4, "Quantidade de identificadores de barreira"
@@ -525,14 +761,16 @@ index 0000000000..9e79c2d0c2
 +DebugFlag("BarrierMonitor")
 diff --git a/src/projetos/p02/barrier_monitor.cc b/src/projetos/p02/barrier_monitor.cc
 new file mode 100644
-index 0000000000..2c2c6a7b78
+index 0000000000..dbafc8baa0
 --- /dev/null
 +++ b/src/projetos/p02/barrier_monitor.cc
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,226 @@
 +/* Etapa 02 */
 +
 +#include "projetos/p02/barrier_monitor.hh"
 +#include "base/logging.hh"
++#include "base/trace.hh"
++#include "debug/BarrierMonitor.hh"
 +#include "cpu/base.hh"
 +#include "cpu/thread_context.hh"
 +#include <gem5/p02_barrier_events.h>
@@ -631,7 +869,7 @@ index 0000000000..2c2c6a7b78
 +            ThreadContext *context = (*cpu).getContext(0);
 +
 +            if ((*context).contextId() != i) {
-+                fatal("O identificador do contexto nao corresponde a ordem das CPUs.");
++                fatal("O id do contexto não corresponde a ordem das CPUs.");
 +            }
 +        }
 +    }
@@ -643,6 +881,10 @@ index 0000000000..2c2c6a7b78
 +        uint64_t phase
 +    )
 +    {
++        DPRINTF(BarrierMonitor,
++                "Evento: contexto=%d barreira=%llu fase=%llu\n",
++                ctx, id, phase);
++
 +        if (ctx >= ctxs.size()) {
 +            stats.invalidEvents++;
 +            return;
@@ -844,7 +1086,7 @@ index 0000000000..0e7ebc386b
 +
 +#endif
 diff --git a/src/sim/pseudo_inst.cc b/src/sim/pseudo_inst.cc
-index adc66d1c84..db97eff08e 100644
+index adc66d1c84..1b91c7030d 100644
 --- a/src/sim/pseudo_inst.cc
 +++ b/src/sim/pseudo_inst.cc
 @@ -70,6 +70,8 @@
@@ -868,7 +1110,7 @@ index adc66d1c84..db97eff08e 100644
 +    BarrierMonitor *monitor = BarrierMonitor::instance();
 +
 +    if (monitor == nullptr) {
-+        warn_once("m5_barrier: BarrierMonitor ausente; evento ignorado.\n");
++        warn_once("m5_barrier: não tem BarrierMonitor.\n");
 +        return;
 +    }
 +
@@ -911,6 +1153,103 @@ index 6815e1160b..c588be459e 100644
          warn("Unimplemented m5 op (%#x)\n", func);
          return false;
  
+diff --git a/workloads/p02/.gitignore b/workloads/p02/.gitignore
+new file mode 100644
+index 0000000000..ae3c172604
+--- /dev/null
++++ b/workloads/p02/.gitignore
+@@ -0,0 +1 @@
++/bin/
+diff --git a/workloads/p02/Makefile b/workloads/p02/Makefile
+new file mode 100644
+index 0000000000..9781dc48bf
+--- /dev/null
++++ b/workloads/p02/Makefile
+@@ -0,0 +1,67 @@
++CXX = g++
++CXXFLAGS = -O2 -std=c++17 -pthread -Wall -Wextra -I../../include
++
++COMMON = barreira.cc central.cc dissem.cc
++HEADERS = barreira.h central.h dissem.h ../../include/gem5/p02_barrier_events.h
++M5LIB = ../../util/m5/build/x86/out/libm5.a
++M5HEADERS = ../../include/gem5/m5ops.h
++
++.PHONY: all native sequential sim clean
++
++all: native sim
++
++native: bin/micro_native bin/jacobi_native bin/integ_native bin/barrier_stress sequential
++
++sequential: bin/micro_seq bin/jacobi_seq bin/integ_seq
++
++sim: bin/micro bin/micro_noevents bin/jacobi bin/integ bin/atomic_counter bin/teste_m5_barrier bin/teste_monitor
++
++bin:
++	mkdir -p bin
++
++bin/micro_seq: sequential/micro_seq.cc | bin
++	$(CXX) $(CXXFLAGS) sequential/micro_seq.cc -o bin/micro_seq
++
++bin/jacobi_seq: sequential/jacobi_seq.cc | bin
++	$(CXX) $(CXXFLAGS) sequential/jacobi_seq.cc -o bin/jacobi_seq
++
++bin/integ_seq: sequential/integ_seq.cc | bin
++	$(CXX) $(CXXFLAGS) sequential/integ_seq.cc -o bin/integ_seq
++
++bin/micro_native: micro.cc $(COMMON) $(HEADERS) | bin
++	$(CXX) $(CXXFLAGS) micro.cc $(COMMON) -o bin/micro_native
++
++bin/jacobi_native: jacobi.cc $(COMMON) $(HEADERS) | bin
++	$(CXX) $(CXXFLAGS) jacobi.cc $(COMMON) -o bin/jacobi_native
++
++bin/integ_native: integ.cc $(COMMON) $(HEADERS) | bin
++	$(CXX) $(CXXFLAGS) integ.cc $(COMMON) -o bin/integ_native
++
++bin/barrier_stress: barrier_stress.cc $(COMMON) $(HEADERS) | bin
++	$(CXX) $(CXXFLAGS) barrier_stress.cc $(COMMON) -o bin/barrier_stress
++
++bin/micro: micro.cc $(COMMON) $(HEADERS) $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static -DUSE_M5OPS micro.cc $(COMMON) $(M5LIB) -o bin/micro
++
++bin/micro_noevents: micro.cc $(COMMON) $(HEADERS) $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static -DUSE_M5OPS -DNO_BARRIER_EVENTS micro.cc $(COMMON) $(M5LIB) -o bin/micro_noevents
++
++bin/jacobi: jacobi.cc $(COMMON) $(HEADERS) $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static -DUSE_M5OPS jacobi.cc $(COMMON) $(M5LIB) -o bin/jacobi
++
++bin/integ: integ.cc $(COMMON) $(HEADERS) $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static -DUSE_M5OPS integ.cc $(COMMON) $(M5LIB) -o bin/integ
++
++bin/atomic_counter: atomic_counter.cc $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static atomic_counter.cc $(M5LIB) -o bin/atomic_counter
++
++bin/teste_m5_barrier: teste_m5_barrier.cc $(HEADERS) $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static teste_m5_barrier.cc $(M5LIB) -o bin/teste_m5_barrier
++
++bin/teste_monitor: teste_monitor.cc $(HEADERS) $(M5HEADERS) $(M5LIB) | bin
++	$(CXX) $(CXXFLAGS) -static teste_monitor.cc $(M5LIB) -o bin/teste_monitor
++
++clean:
++	rm -f bin/micro_noevents
++	rm -f bin/micro_seq bin/jacobi_seq bin/integ_seq
++	rm -f bin/micro_native bin/jacobi_native bin/integ_native bin/barrier_stress bin/micro bin/jacobi bin/integ bin/atomic_counter bin/teste_m5_barrier bin/teste_monitor
+diff --git a/workloads/p02/atomic_counter.cc b/workloads/p02/atomic_counter.cc
+new file mode 100644
+index 0000000000..727e007e90
+--- /dev/null
++++ b/workloads/p02/atomic_counter.cc
+@@ -0,0 +1,11 @@
++#include <atomic>
++#include <gem5/m5ops.h>
++
++int main()
++{
++    std::atomic<unsigned> value{0};
++    m5_reset_stats(0, 0);
++    for (unsigned i = 0; i < 1000; ++i) value.fetch_add(1, std::memory_order_relaxed);
++    m5_dump_stats(0, 0);
++    return value.load() != 1000;
++}
 diff --git a/workloads/p02/barreira.cc b/workloads/p02/barreira.cc
 new file mode 100644
 index 0000000000..ddc805b3c9
@@ -949,10 +1288,10 @@ index 0000000000..ddc805b3c9
 +}
 diff --git a/workloads/p02/barreira.h b/workloads/p02/barreira.h
 new file mode 100644
-index 0000000000..0050dc5297
+index 0000000000..85f20768cc
 --- /dev/null
 +++ b/workloads/p02/barreira.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,62 @@
 +/* Etapa 04 */
 +
 +#pragma once
@@ -966,6 +1305,9 @@ index 0000000000..0050dc5297
 +
 +#ifdef USE_M5OPS
 +#include <gem5/m5ops.h>
++#endif
++
++#if defined(USE_M5OPS) && !defined(NO_BARRIER_EVENTS)
 +#define P02_EVENT(id, phase) m5_barrier((id), (phase))
 +#else
 +#define P02_EVENT(id, phase) ((void)0)
@@ -1012,6 +1354,42 @@ index 0000000000..0050dc5297
 +    uint64_t id,
 +    unsigned threshold
 +);
+diff --git a/workloads/p02/barrier_stress.cc b/workloads/p02/barrier_stress.cc
+new file mode 100644
+index 0000000000..cfca7e4dd6
+--- /dev/null
++++ b/workloads/p02/barrier_stress.cc
+@@ -0,0 +1,30 @@
++#include <cassert>
++#include <atomic>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#include "barreira.h"
++
++int main()
++{
++    for (unsigned participants : {1u, 2u, 3u, 5u, 8u}) {
++        for (Algorithm algorithm : {Algorithm::Central, Algorithm::Dissem}) {
++            auto barrier = createBarrier(algorithm, participants, 1, 4);
++            struct alignas(CACHE_LINE) Slot { std::atomic<unsigned> episode{0}; };
++            std::vector<Slot> slots(participants);
++            auto worker = [&](unsigned tid) {
++                for (unsigned episode = 1; episode <= 10000; ++episode) {
++                    slots[tid].episode.store(episode, std::memory_order_relaxed);
++                    barrier->wait(tid);
++                    for (auto &slot : slots)
++                        assert(slot.episode.load(std::memory_order_acquire) >= episode);
++                }
++            };
++            std::vector<std::thread> threads;
++            for (unsigned tid = 1; tid < participants; ++tid) threads.emplace_back(worker, tid);
++            worker(0);
++            for (auto &thread : threads) thread.join();
++        }
++    }
++}
 diff --git a/workloads/p02/central.cc b/workloads/p02/central.cc
 new file mode 100644
 index 0000000000..b607b6e9f8
@@ -1079,10 +1457,10 @@ index 0000000000..a7efa75bad
 +};
 diff --git a/workloads/p02/dissem.cc b/workloads/p02/dissem.cc
 new file mode 100644
-index 0000000000..d89a05e360
+index 0000000000..c0c78e1b53
 --- /dev/null
 +++ b/workloads/p02/dissem.cc
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,58 @@
 +/* Etapa 05 */
 +
 +#include "dissem.h"
@@ -1100,24 +1478,21 @@ index 0000000000..d89a05e360
 +    }
 +
 +    for (unsigned tid = 0; tid < numParticipants; tid++) {
-+        ThreadData &thread = threads[tid];
++        threads[tid].flags[0] = std::make_unique<Flag[]>(rounds);
++        threads[tid].flags[1] = std::make_unique<Flag[]>(rounds);
 +
-+        for (unsigned parity = 0; parity < 2; parity++) {
-+            thread.flags[parity] = std::make_unique<Flag[]>(rounds);
-+            thread.partners[parity].resize(rounds);
-+        }
++        threads[tid].partners[0].resize(rounds);
++        threads[tid].partners[1].resize(rounds);
 +    }
 +
 +    for (unsigned tid = 0; tid < numParticipants; tid++) {
-+        ThreadData &thread = threads[tid];
 +        distance = 1;
 +
 +        for (unsigned round = 0; round < rounds; round++) {
 +            unsigned partner = (tid + distance) % numParticipants;
 +
-+            for (unsigned parity = 0; parity < 2; parity++) {
-+                thread.partners[parity][round] = &threads[partner].flags[parity][round];
-+            }
++            threads[tid].partners[0][round] = &threads[partner].flags[0][round];
++            threads[tid].partners[1][round] = &threads[partner].flags[1][round];
 +
 +            distance *= 2;
 +        }
@@ -1126,23 +1501,23 @@ index 0000000000..d89a05e360
 +
 +void DisseminationBarrier::waitImpl(unsigned tid)
 +{
-+    ThreadData &thread = threads[tid];
-+    unsigned parity = thread.parity;
++    ThreadData &data = threads[tid];
++    unsigned parity = data.parity;
 +
 +    for (unsigned round = 0; round < rounds; round++) {
-+        Flag *partner = thread.partners[parity][round];
-+        Flag &flag = thread.flags[parity][round];
++        Flag *destination = data.partners[parity][round];
++        Flag &local = data.flags[parity][round];
 +
-+        (*partner).value.store(thread.sense, std::memory_order_release);
++        (*destination).value.store(data.sense, std::memory_order_release);
 +
-+        while (flag.value.load(std::memory_order_acquire) != thread.sense) { }
++        while (local.value.load(std::memory_order_acquire) != data.sense) { }
 +    }
 +
 +    if (parity == 1) {
-+        thread.sense = 1 - thread.sense;
++        data.sense = 1 - data.sense;
 +    }
 +
-+    thread.parity = 1 - parity;
++    data.parity = 1 - parity;
 +}
 diff --git a/workloads/p02/dissem.h b/workloads/p02/dissem.h
 new file mode 100644
@@ -1182,12 +1557,528 @@ index 0000000000..3128633720
 +    unsigned rounds;
 +    std::vector<ThreadData> threads;
 +};
+diff --git a/workloads/p02/integ.cc b/workloads/p02/integ.cc
+new file mode 100644
+index 0000000000..16a50f38df
+--- /dev/null
++++ b/workloads/p02/integ.cc
+@@ -0,0 +1,220 @@
++#include <cstdint>
++#include <functional>
++#include <iomanip>
++#include <iostream>
++#include <random>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++#include "central.h"
++
++struct Params
++{
++    unsigned threads = 4;
++    unsigned iters = 100;
++    unsigned work = 10000;
++    unsigned threshold = 8;
++    unsigned seed = 0;
++    unsigned warmup = 10;
++    Algorithm algorithm = Algorithm::Central;
++};
++
++double workIntegrer(unsigned tid, const Params &params, double parameter)
++{
++    // Cada thread integra pela regra do ponto médio.
++    uint64_t n = params.work;
++    uint64_t first = n * tid / params.threads;
++    uint64_t end = (n * tid + n) / params.threads;
++    double width = 1.0 / n;
++    double sum = 0.0;
++
++    for (uint64_t i = first; i < end; i++) {
++        double x = (i + 0.5) * width;
++        sum += parameter * x * x * width;
++    }
++    return sum;
++}
++
++void participant(
++    unsigned tid,
++    const Params &params,
++    Barrier &measured,
++    Barrier &control,
++    std::vector<double> &partial,
++    double &parameter,
++    double &result
++){
++    std::mt19937 generator(params.seed + tid);
++    unsigned delay = generator() % 300;
++    for (volatile unsigned i = 0; i < delay; i++) { }
++
++    for (unsigned i = 0; i < params.warmup; i++) {
++        // Calcula as parciais (retangulos)
++        partial[tid] = workIntegrer(tid, params, parameter);
++        measured.wait(tid);
++
++        if (tid == 0) {
++            result = 0.0;
++            for (double value : partial) {
++                result += value;
++            }
++            // Muda o parâmetro para os novos parciais
++            parameter = 1.0 + result;
++        }
++        measured.wait(tid);
++    }
++
++    control.wait(tid);
++
++    if (tid == 0) {
++        parameter = 1.0;
++    }
++
++    #ifdef USE_M5OPS
++        if (tid == 0) {
++            m5_reset_stats(0, 0);
++        }
++    #endif
++
++    control.wait(tid);
++
++    for (unsigned iteration = 0; iteration < params.iters; iteration++) {
++        // Calcula as parciais (retangulos)
++        partial[tid] = workIntegrer(tid, params, parameter);
++        measured.wait(tid);
++
++        if (tid == 0) {
++            result = 0.0;
++            for (double value : partial) {
++                result += value;
++            }
++            // Muda o parâmetro para os novos parciais
++            parameter = 1.0 + result;
++        }
++        measured.wait(tid);
++    }
++
++    control.wait(tid);
++
++    #ifdef USE_M5OPS
++        if (tid == 0) {
++            m5_dump_stats(0, 0);
++        }
++    #endif
++}
++
++int main(int argc, char *argv[])
++{
++    Params params;
++
++    // Lê as opções do terminal.
++    for (int i = 1; i < argc; i += 2) {
++        std::string option = argv[i];
++
++        if (option == "--help") {
++            std::cout
++                << "Opções: --threads N --iters N --work N "
++                << "--alg central|dissem|auto --limiar N "
++                << "--imbalance F --perturb N\n";
++            return 0;
++        }
++
++        if (i + 1 >= argc) {
++            std::cerr << "Falta o valor de " << option << "\n";
++            return 1;
++        }
++
++        std::string text = argv[i + 1];
++
++        if (option == "--alg") {
++            if (text == "central") {
++                params.algorithm = Algorithm::Central;
++            } else if (text == "dissem") {
++                params.algorithm = Algorithm::Dissem;
++            } else if (text == "auto") {
++                params.algorithm = Algorithm::Auto;
++            } else {
++                std::cerr << "Algoritmo inválido: " << text << "\n";
++                return 1;
++            }
++
++            continue;
++        }
++
++        if (text.empty() || text[0] == '-') {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++
++        std::istringstream value(text);
++
++        if (option == "--threads") {
++            value >> params.threads;
++        } else if (option == "--iters") {
++            value >> params.iters;
++        } else if (option == "--work") {
++            value >> params.work;
++        } else if (option == "--limiar") {
++            value >> params.threshold;
++        } else if (option == "--imbalance") {
++            double imbalance;
++            value >> imbalance;
++        } else if (option == "--perturb") {
++            value >> params.seed;
++        } else {
++            std::cerr << "Opção desconhecida: " << option << "\n";
++            return 1;
++        }
++
++        if (value.fail() || !value.eof()) {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++    }
++
++    // Confere os parâmetros.
++    if (params.threads == 0 || params.iters == 0) {
++        std::cerr << "Threads e iterações devem ser maiores que zero.\n";
++        return 1;
++    }
++
++    if (params.work == 0) {
++        std::cerr << "Informe pelo menos um subintervalo.\n";
++        return 1;
++    }
++
++    if (params.algorithm == Algorithm::Auto && params.threshold == 0) {
++        std::cerr << "Informe --limiar maior que zero para usar auto.\n";
++        return 1;
++    }
++
++    auto measured = createBarrier(params.algorithm, params.threads, 1, params.threshold);
++    CentralBarrier control(params.threads, P02_BARRIER_CTRL);
++    std::vector<double> partial(params.threads);
++    double parameter = 1.0;
++    double result = 0.0;
++    std::vector<std::thread> threads;
++
++    for (unsigned tid = 1; tid < params.threads; tid++) {
++        threads.emplace_back(
++            participant,
++            tid,
++            std::cref(params),
++            std::ref(*measured),
++            std::ref(control),
++            std::ref(partial),
++            std::ref(parameter),
++            std::ref(result)
++        );
++    }
++
++    participant(0, params, *measured, control, partial, parameter, result);
++    for (auto &thread : threads) {
++        thread.join();
++    }
++
++    std::cout << std::setprecision(17) << "Resultado: " << result << "\n";
++    std::cout << "Episódios medidos: " << 2ULL * params.iters << "\n";
++    return 0;
++}
+diff --git a/workloads/p02/jacobi.cc b/workloads/p02/jacobi.cc
+new file mode 100644
+index 0000000000..e25b1af52c
+--- /dev/null
++++ b/workloads/p02/jacobi.cc
+@@ -0,0 +1,284 @@
++#include <cstdint>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++#include <sstream>
++#include <random>
++
++#include "barreira.h"
++#include "central.h"
++
++struct Params {
++    unsigned threads = 4;
++    unsigned iters = 20;
++    unsigned warmup = 10;
++    unsigned size = 128;
++    unsigned threshold = 8;
++    unsigned seed = 0;
++    unsigned offset = 0;
++
++    Algorithm algorithm = Algorithm::Central;
++};
++
++void workJacobi(
++    unsigned tid,
++    const Params &params,
++    const std::vector<std::vector<uint64_t>> &current,
++    std::vector<std::vector<uint64_t>> &next
++)
++{
++    unsigned interiorRows = params.size - 2;
++    unsigned firstRow = 1 + interiorRows * tid / params.threads;
++    unsigned lastRow = 1 + interiorRows * (tid + 1) / params.threads;
++
++    // Cada thread calcula suas linhas.
++    for (unsigned row = firstRow; row < lastRow; row++) {
++        for (unsigned column = 1; column < params.size - 1; column++) {
++            unsigned col = column + params.offset;
++
++            uint64_t top = current[row - 1][col];
++            uint64_t bottom = current[row + 1][col];
++            uint64_t left = current[row][col - 1];
++            uint64_t right = current[row][col + 1];
++
++            next[row][col] = (top + bottom + left + right) / 4;
++        }
++    }
++}
++
++void participant(
++    unsigned tid,
++    const Params &params,
++    Barrier &measured,
++    Barrier &control,
++    std::vector<std::vector<uint64_t>> &gridA,
++    std::vector<std::vector<uint64_t>> &gridB
++)
++{
++    std::mt19937 delayGenerator(params.seed + tid);
++    unsigned delay = delayGenerator() % 300;
++
++    for (volatile unsigned i = 0; i < delay; i++) {}
++
++    // Cada thread tem seus ponteiros
++    std::vector<std::vector<uint64_t>> *current = &gridA;
++    std::vector<std::vector<uint64_t>> *next = &gridB;
++
++    // Aquecimento
++    for (unsigned i = 0; i < params.warmup; i++) {
++        workJacobi(tid, params, *current, *next);
++        measured.wait(tid);
++        std::swap(current, next);
++    }
++
++    control.wait(tid);
++
++    if (tid == 0) {
++        // As bordas continuam em 100; apenas o interior foi alterado.
++        for (unsigned row = 1; row < params.size - 1; row++) {
++            for (unsigned column = 1; column < params.size - 1; column++) {
++                gridA[row][column + params.offset] = 1;
++                gridB[row][column + params.offset] = 1;
++            }
++        }
++
++        #ifdef USE_M5OPS
++                m5_reset_stats(0, 0);
++        #endif
++    }
++
++    // A medição sempre começa lendo A e escrevendo B.
++    current = &gridA;
++    next = &gridB;
++
++    // Espera a restauração das matrizes e o reset das estatísticas.
++    control.wait(tid);
++
++    for (unsigned iteration = 0; iteration < params.iters; iteration++) {
++        workJacobi(tid, params, *current, *next);
++        // Todos precisam terminar antes da próxima iteração.
++        measured.wait(tid);
++        std::swap(current, next);
++    }
++
++    control.wait(tid);
++
++    #ifdef USE_M5OPS
++        if (tid == 0) {
++            m5_dump_stats(0, 0);
++        }
++    #endif
++}
++
++
++int main(int argc, char *argv[])
++{
++    Params params;
++
++    // Lê as opções do terminal.
++    for (int i = 1; i < argc; i += 2) {
++        std::string option = argv[i];
++
++        if (option == "--help") {
++            std::cout
++                << "Opções: --threads N --iters N --work N "
++                << "--alg central|dissem|auto --limiar N "
++                << "--imbalance F --perturb N\n";
++            return 0;
++        }
++
++        if (i + 1 >= argc) {
++            std::cerr << "Falta o valor de " << option << "\n";
++            return 1;
++        }
++
++        std::string text = argv[i + 1];
++
++        if (option == "--alg") {
++            if (text == "central") {
++                params.algorithm = Algorithm::Central;
++            } else if (text == "dissem") {
++                params.algorithm = Algorithm::Dissem;
++            } else if (text == "auto") {
++                params.algorithm = Algorithm::Auto;
++            } else {
++                std::cerr << "Algoritmo inválido: " << text << "\n";
++                return 1;
++            }
++
++            continue;
++        }
++
++        if (text.empty() || text[0] == '-') {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++
++        std::istringstream value(text);
++
++        if (option == "--threads") {
++            value >> params.threads;
++        } else if (option == "--iters") {
++            value >> params.iters;
++        } else if (option == "--work") {
++            value >> params.size;
++        } else if (option == "--limiar") {
++            value >> params.threshold;
++        } else if (option == "--imbalance") {
++            double imbalance;
++            value >> imbalance;
++        } else if (option == "--perturb") {
++            value >> params.seed;
++        } else {
++            std::cerr << "Opção desconhecida: " << option << "\n";
++            return 1;
++        }
++
++        if (value.fail() || !value.eof()) {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++    }
++
++    // Confere os parâmetros.
++    if (params.threads == 0 || params.iters == 0) {
++        std::cerr << "Threads e iterações devem ser maiores que zero.\n";
++        return 1;
++    }
++
++    if (params.size < 3) {
++        std::cerr << "O tamanho da matriz deve ser pelo menos 3.\n";
++        return 1;
++    }
++
++    if (params.algorithm == Algorithm::Auto && params.threshold == 0) {
++        std::cerr << "Informe --limiar maior que zero.\n";
++        return 1;
++    }
++
++    std::mt19937 generator(params.seed);
++    params.offset = generator() % 8;
++
++    // Cria a primeira matriz preenchida com 1.
++    std::vector<std::vector<uint64_t>> gridA(
++        params.size,
++        std::vector<uint64_t>(params.size + params.offset, 1)
++    );
++
++    // Define as bordas com 100.
++    for (unsigned i = 0; i < params.size; i++) {
++        gridA[0][i + params.offset] = 100;
++        gridA[params.size - 1][i + params.offset] = 100;
++
++        gridA[i][params.offset] = 100;
++        gridA[i][params.offset + params.size - 1] = 100;
++    }
++
++    // Cria a segunda matriz com os mesmos valores
++    std::vector<std::vector<uint64_t>> gridB = gridA;
++
++    // Cria a barreira que será medida.
++    std::unique_ptr<Barrier> measured = createBarrier(
++        params.algorithm,
++        params.threads,
++        1,
++        params.threshold
++    );
++
++    if (!measured) {
++        std::cerr << "Não foi possível criar a barreira.\n";
++        return 1;
++    }
++
++    // Cria a barreira de controle da região de interesse.
++    CentralBarrier control(params.threads, P02_BARRIER_CTRL);
++
++    // Inicia as threads adicionais.
++    std::vector<std::thread> threads;
++
++    for (unsigned tid = 1; tid < params.threads; tid++) {
++        threads.emplace_back(
++            participant,
++            tid,
++            std::cref(params),
++            std::ref(*measured),
++            std::ref(control),
++            std::ref(gridA),
++            std::ref(gridB)
++        );
++    }
++
++    // A thread principal também calcula.
++    participant(0, params, *measured, control, gridA, gridB);
++
++    // Espera todas terminarem.
++    for (std::thread &thread : threads) {
++        thread.join();
++    }
++
++    const std::vector<std::vector<uint64_t>> *finalGrid;
++
++    if (params.iters % 2 == 0) {
++        finalGrid = &gridA;
++    } else {
++        finalGrid = &gridB;
++    }
++
++    // Soma os pontos da matriz final.
++    uint64_t total = 0;
++
++    for (unsigned row = 0; row < params.size; row++) {
++        for (unsigned column = 0; column < params.size; column++) {
++            total += (*finalGrid)[row][column + params.offset];
++        }
++    }
++
++    std::cout << "Threads: " << params.threads << "\n";
++    std::cout << "Iterações medidas: " << params.iters << "\n";
++    std::cout << "Episódios medidos: " << params.iters << "\n";
++    std::cout << "Resultado: " << total << "\n";
++
++    return 0;
++}
 diff --git a/workloads/p02/micro.cc b/workloads/p02/micro.cc
 new file mode 100644
-index 0000000000..5f1f39a8bc
+index 0000000000..8688ceece7
 --- /dev/null
 +++ b/workloads/p02/micro.cc
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,222 @@
 +/* Listagem 11.13 */
 +/* 11.9 */
 +
@@ -1214,8 +2105,7 @@ index 0000000000..5f1f39a8bc
 +    unsigned threshold = 0;
 +};
 +
-+uint64_t
-+syntheticWork(
++uint64_t syntheticWork(
 +    unsigned tid,
 +    const Params &params,
 +    std::mt19937 &generator
@@ -1246,6 +2136,11 @@ index 0000000000..5f1f39a8bc
 +    uint64_t &result
 +)
 +{
++    std::mt19937 delayGenerator(params.seed + tid);
++    unsigned delay = delayGenerator() % 300;
++
++    for (volatile unsigned i = 0; i < delay; i++) {}
++
 +    std::mt19937 generator(params.seed + tid);
 +    uint64_t total = 0;
 +
@@ -1257,11 +2152,11 @@ index 0000000000..5f1f39a8bc
 +
 +    control.wait(tid);
 +
-+#ifdef USE_M5OPS
-+    if (tid == 0) {
-+        m5_reset_stats(0, 0);
-+    }
-+#endif
++    #ifdef USE_M5OPS
++        if (tid == 0) {
++            m5_reset_stats(0, 0);
++        }
++    #endif
 +
 +    control.wait(tid);
 +
@@ -1273,11 +2168,11 @@ index 0000000000..5f1f39a8bc
 +
 +    control.wait(tid);
 +
-+#ifdef USE_M5OPS
-+    if (tid == 0) {
-+        m5_dump_stats(0, 0);
-+    }
-+#endif
++    #ifdef USE_M5OPS
++        if (tid == 0) {
++            m5_dump_stats(0, 0);
++        }
++    #endif
 +
 +    result = total;
 +}
@@ -1406,6 +2301,327 @@ index 0000000000..5f1f39a8bc
 +
 +    return 0;
 +}
+diff --git a/workloads/p02/sequential/integ_seq.cc b/workloads/p02/sequential/integ_seq.cc
+new file mode 100644
+index 0000000000..e3f455ffe6
+--- /dev/null
++++ b/workloads/p02/sequential/integ_seq.cc
+@@ -0,0 +1,98 @@
++#include <cstdint>
++#include <iomanip>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++int main(int argc, char *argv[])
++{
++    unsigned threads = 4;
++    unsigned iters = 100;
++    unsigned work = 10000;
++
++    // Lê os argumentos.
++    for (int i = 1; i < argc; i += 2) {
++        std::string option = argv[i];
++
++        if (option == "--help") {
++            std::cout << "Opções: --threads N --iters N --work N\n";
++            return 0;
++        }
++
++        if (i + 1 >= argc) {
++            std::cerr << "Falta o valor de " << option << "\n";
++            return 1;
++        }
++
++        std::string text = argv[i + 1];
++
++        if (text.empty() || text[0] == '-') {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++
++        std::istringstream value(text);
++
++        if (option == "--threads") {
++            value >> threads;
++        } else if (option == "--iters") {
++            value >> iters;
++        } else if (option == "--work") {
++            value >> work;
++        } else {
++            std::cerr << "Opção desconhecida: " << option << "\n";
++            return 1;
++        }
++
++        if (value.fail() || !value.eof()) {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++    }
++
++    if (threads == 0 || iters == 0 || work == 0) {
++        std::cerr
++            << "Threads, iterações e trabalho devem ser maiores que zero.\n";
++        return 1;
++    }
++
++    std::vector<double> partial(threads);
++
++    uint64_t n = work;
++    double width = 1.0 / n;
++    double parameter = 1.0;
++    double result = 0.0;
++
++    for (unsigned iteration = 0; iteration < iters; iteration++) {
++
++        // Calcula cada parcial, uma de cada vez.
++        for (unsigned tid = 0; tid < threads; tid++) {
++            uint64_t first = n * tid / threads;
++            uint64_t end = (n * tid + n) / threads;
++            double sum = 0.0;
++
++            for (uint64_t i = first; i < end; i++) {
++                double x = (i + 0.5) * width;
++                sum += parameter * x * x * width;
++            }
++
++            partial[tid] = sum;
++        }
++
++        // Combina as parciais na mesma ordem do paralelo.
++        result = 0.0;
++
++        for (unsigned tid = 0; tid < threads; tid++) {
++            result += partial[tid];
++        }
++
++        parameter = 1.0 + result;
++    }
++
++    std::cout
++        << std::setprecision(17)
++        << "Resultado: " << result << "\n";
++
++    return 0;
++}
+diff --git a/workloads/p02/sequential/jacobi_seq.cc b/workloads/p02/sequential/jacobi_seq.cc
+new file mode 100644
+index 0000000000..85c439deed
+--- /dev/null
++++ b/workloads/p02/sequential/jacobi_seq.cc
+@@ -0,0 +1,105 @@
++#include <cstdint>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <utility>
++#include <vector>
++
++int main(int argc, char *argv[])
++{
++    unsigned size = 128;
++    unsigned iters = 20;
++
++    // Lê os argumentos.
++    for (int i = 1; i < argc; i += 2) {
++        std::string option = argv[i];
++
++        if (option == "--help") {
++            std::cout << "Opções: --work N --iters N\n";
++            return 0;
++        }
++
++        if (i + 1 >= argc) {
++            std::cerr << "Falta o valor de " << option << "\n";
++            return 1;
++        }
++
++        std::string text = argv[i + 1];
++
++        if (text.empty() || text[0] == '-') {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++
++        std::istringstream value(text);
++
++        if (option == "--work") {
++            value >> size;
++        } else if (option == "--iters") {
++            value >> iters;
++        } else {
++            std::cerr << "Opção desconhecida: " << option << "\n";
++            return 1;
++        }
++
++        if (value.fail() || !value.eof()) {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++    }
++
++    if (size < 3 || iters == 0) {
++        std::cerr
++            << "O tamanho deve ser pelo menos 3 "
++            << "e as iterações devem ser maiores que zero.\n";
++        return 1;
++    }
++
++    // Cria a primeira matriz.
++    std::vector<std::vector<uint64_t>> current(
++        size,
++        std::vector<uint64_t>(size, 1)
++    );
++
++    // Define as bordas fixas.
++    for (unsigned i = 0; i < size; i++) {
++        current[0][i] = 100;
++        current[size - 1][i] = 100;
++        current[i][0] = 100;
++        current[i][size - 1] = 100;
++    }
++
++    // A segunda matriz começa igual à primeira.
++    std::vector<std::vector<uint64_t>> next = current;
++
++    // Executa as iterações.
++    for (unsigned iteration = 0; iteration < iters; iteration++) {
++        for (unsigned row = 1; row < size - 1; row++) {
++            for (unsigned column = 1; column < size - 1; column++) {
++                uint64_t top = current[row - 1][column];
++                uint64_t bottom = current[row + 1][column];
++                uint64_t left = current[row][column - 1];
++                uint64_t right = current[row][column + 1];
++
++                next[row][column] =
++                    (top + bottom + left + right) / 4;
++            }
++        }
++
++        std::swap(current, next);
++    }
++
++    // Soma os pontos da matriz final.
++    uint64_t total = 0;
++
++    for (unsigned row = 0; row < size; row++) {
++        for (unsigned column = 0; column < size; column++) {
++            total += current[row][column];
++        }
++    }
++
++    std::cout << "Iterações: " << iters << "\n";
++    std::cout << "Resultado: " << total << "\n";
++
++    return 0;
++}
+diff --git a/workloads/p02/sequential/micro_seq.cc b/workloads/p02/sequential/micro_seq.cc
+new file mode 100644
+index 0000000000..4f97264109
+--- /dev/null
++++ b/workloads/p02/sequential/micro_seq.cc
+@@ -0,0 +1,100 @@
++#include <cstdint>
++#include <iostream>
++#include <random>
++#include <sstream>
++#include <string>
++
++int main(int argc, char *argv[])
++{
++    unsigned threads = 4;
++    unsigned iters = 100;
++    unsigned warmup = 10;
++
++    uint64_t work = 1000;
++    double imbalance = 0.0;
++    uint64_t seed = 1;
++
++    // Lê os argumentos.
++    for (int i = 1; i < argc; i += 2) {
++        std::string option = argv[i];
++
++        if (option == "--help") {
++            std::cout
++                << "Opções: --threads N --iters N --work N "
++                << "--imbalance F --perturb N\n";
++            return 0;
++        }
++
++        if (i + 1 >= argc) {
++            std::cerr << "Falta o valor de " << option << "\n";
++            return 1;
++        }
++
++        std::string text = argv[i + 1];
++
++        if (text.empty() || text[0] == '-') {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++
++        std::istringstream value(text);
++
++        if (option == "--threads") {
++            value >> threads;
++        } else if (option == "--iters") {
++            value >> iters;
++        } else if (option == "--work") {
++            value >> work;
++        } else if (option == "--imbalance") {
++            value >> imbalance;
++        } else if (option == "--perturb") {
++            value >> seed;
++        } else {
++            std::cerr << "Opção desconhecida: " << option << "\n";
++            return 1;
++        }
++
++        if (value.fail() || !value.eof()) {
++            std::cerr << "Valor inválido para " << option << "\n";
++            return 1;
++        }
++    }
++
++    if (threads == 0 || iters == 0) {
++        std::cerr << "Threads e iterações devem ser maiores que zero.\n";
++        return 1;
++    }
++
++    uint64_t total = 0;
++    uint64_t totalIterations = uint64_t(warmup) + iters;
++
++    // Faz o trabalho de cada thread, uma de cada vez.
++    for (unsigned tid = 0; tid < threads; tid++) {
++        std::mt19937 generator(seed + tid);
++        std::uniform_real_distribution<double> distribution(0.0, 1.0);
++
++        for (uint64_t iteration = 0;
++             iteration < totalIterations;
++             iteration++) {
++
++            uint64_t n = work;
++
++            if (imbalance > 0 && n > 0) {
++                double u = distribution(generator);
++                n += static_cast<uint64_t>(n * imbalance * u);
++            }
++
++            uint64_t acc = tid + 1;
++
++            for (uint64_t k = 0; k < n; k++) {
++                acc = acc * 3 + k;
++            }
++
++            total += acc;
++        }
++    }
++
++    std::cout << "Resultado: " << total << "\n";
++
++    return 0;
++}
 diff --git a/workloads/p02/teste_m5_barrier.cc b/workloads/p02/teste_m5_barrier.cc
 new file mode 100644
 index 0000000000..bc47eec765
@@ -1424,7 +2640,7 @@ index 0000000000..bc47eec765
 +}
 diff --git a/workloads/p02/teste_monitor.cc b/workloads/p02/teste_monitor.cc
 new file mode 100644
-index 0000000000..cda6cd23f7
+index 0000000000..76221e0df3
 --- /dev/null
 +++ b/workloads/p02/teste_monitor.cc
 @@ -0,0 +1,54 @@
@@ -1458,7 +2674,7 @@ index 0000000000..cda6cd23f7
 +
 +int main(int argc, char *argv[])
 +{
-+    if (argc == 2 && std::string(argv[1]) == "--com-barreira") {
++    if (argc == 2 && std::string(argv[1]) == "--use-barrier") {
 +        useBarrier = true;
 +    }
 +
